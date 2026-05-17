@@ -1,369 +1,371 @@
-hola
+# Endpoint desplegado en Azure
 
-voy a entrenarlo en colab
+**URL para entregar al torneo/profesor:**
 
-https://drive.google.com/drive/folders/1GMTKQ0O5SXmRnh--9mFzw9uoWuXcvFub?usp=sharing
+```text
+https://fact-checking-api.wittypond-c03af643.eastus.azurecontainerapps.io/predict
+```
+
+**Health check:**
+
+```text
+https://fact-checking-api.wittypond-c03af643.eastus.azurecontainerapps.io/health
+```
+
+---
 
 # Fact-Check Vietnamita - Sistema de Verificación de Afirmaciones
 
-Sistema de fact-checking para idioma vietnamita con arquitectura en cascada:
-**PhoBERT ligero** (ruta rápida) → **mDeBERTa-v3 pesado** (casos difíciles).
-Incluye atención por evidencia, calibración automática de umbrales y monitoreo de drift en producción.
+Sistema de fact-checking para idioma vietnamita desplegado como API con **FastAPI**, **Docker** y **Azure Container Apps**.
+
+La arquitectura final usa una cascada de dos modelos vietnamitas:
+
+```text
+PhoBERT-base  →  si duda  →  PhoBERT-base-v2
+modelo ligero                modelo pesado/fallback
+```
+
+El endpoint final cumple el formato requerido por el torneo:
+
+```json
+{
+  "predicted_label": "SUPPORTED"
+}
+```
+
+o:
+
+```json
+{
+  "predicted_label": "REFUTED"
+}
+```
+
+Aunque los modelos internamente fueron entrenados con tres clases (`SUPPORTED`, `REFUTED`, `NEI`), la API **nunca devuelve `NEI`**. Si internamente aparece `NEI`, el sistema fuerza una decisión binaria comparando las probabilidades de `SUPPORTED` y `REFUTED`.
 
 ---
 
 ## Tabla de Contenidos
 
 1. [Arquitectura General](#arquitectura-general)
-2. [Archivos del Proyecto](#archivos-del-proyecto)
-3. [Requisitos](#requisitos)
-4. [Estructura de Datos](#estructura-de-datos)
-5. [Entrenamiento](#entrenamiento)
-   - [5.1 Modelo Ligero (PhoBERT)](#51-modelo-ligero-phobert)
-   - [5.2 Modelo Pesado (mDeBERTa-v3)](#52-modelo-pesado-mdeberta-v3)
-6. [Inferencia y Cascada](#inferencia-y-cascada)
-7. [Calibración del Router](#calibración-del-router)
-8. [Monitoreo en Producción](#monitoreo-en-producción)
-9. [Formato de Salida](#formato-de-salida)
-10. [Docker y Despliegue](#docker-y-despliegue)
+2. [Resultados de Entrenamiento](#resultados-de-entrenamiento)
+3. [Archivos del Proyecto](#archivos-del-proyecto)
+4. [Estructura Esperada](#estructura-esperada)
+5. [Requisitos](#requisitos)
+6. [Formato de Entrada y Salida](#formato-de-entrada-y-salida)
+7. [Entrenamiento](#entrenamiento)
+8. [Inferencia y Cascada](#inferencia-y-cascada)
+9. [Prueba Local con Uvicorn](#prueba-local-con-uvicorn)
+10. [Docker](#docker)
+11. [Despliegue en Azure](#despliegue-en-azure)
+12. [Notas Técnicas](#notas-técnicas)
 
 ---
 
 ## Arquitectura General
 
-```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   API Request   │────▶│  PhoBERT Ligero │────▶│ mDeBERTa Pesado │
-│  claim+contexts │     │  + Atención     │     │  (si duda)      │
-│                 │     │  por Evidencia  │     │                 │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-         │                       │                       │
-         │                       ▼                       │
-         │              ┌─────────────────┐             │
-         │              │  Router decide: │             │
-         │              │  ¿Confianza     │             │
-         │              │  suficiente?    │             │
-         │              └─────────────────┘             │
-         │                       │                       │
-         ▼                       ▼                       ▼
-   ┌──────────┐           ┌──────────┐           ┌──────────┐
-   │ SUPPORTED│           │ SUPPORTED│           │ SUPPORTED│
-   │ REFUTED  │           │ REFUTED  │           │ REFUTED  │
-   │ (~50ms)  │           │ (~50ms)  │           │ (~200ms) │
-   └──────────┘           └──────────┘           └──────────┘
-        Rápida              Rápida                 Lenta
-      (conf alta)        (umbral calibrado)     (escalar)
+```text
+┌────────────────────┐
+│ API Request         │
+│ claim + contexts    │
+└─────────┬──────────┘
+          │
+          ▼
+┌────────────────────┐
+│ PhoBERT-base        │
+│ modelo ligero       │
+└─────────┬──────────┘
+          │
+          ▼
+┌────────────────────┐
+│ Router de duda      │
+│ confianza/entropía  │
+│ margen/NEI          │
+└──────┬─────────────┘
+       │
+       ├── Alta confianza ─────▶ respuesta binaria
+       │                         SUPPORTED / REFUTED
+       │
+       └── Baja confianza ─────▶ PhoBERT-base-v2
+                                  modelo pesado/fallback
+                                  ↓
+                                  respuesta binaria
+                                  SUPPORTED / REFUTED
 ```
 
-**Flujo de una solicitud:**
-1. El `claim` y sus `contexts` se tokenizan con marcadores especiales `<unused0>` antes de cada evidencia.
-2. El **modelo ligero** (PhoBERT-base + atención entre evidencias) evalúa la solicitud.
-3. El **router** analiza la confianza, entropía y certeza del ligero.
-4. Si los umbrales se cumplen → responde el ligero (~50ms en CPU).
-5. Si no → escala al **modelo pesado** (mDeBERTa-v3, ~200ms en GPU T4).
-6. Si el modelo pesado predice `NEI`, se fuerza a `SUPPORTED` o `REFUTED` con normalización de probabilidades.
+### Flujo de una solicitud
+
+1. El usuario manda un `claim` y una lista de `contexts`.
+2. El modelo ligero `vinai/phobert-base` evalúa primero la solicitud.
+3. El router calcula métricas de incertidumbre: confianza, entropía, margen entre `SUPPORTED` y `REFUTED`, y predicción interna `NEI`.
+4. Si el modelo ligero está seguro, responde directamente.
+5. Si el modelo ligero duda, se escala a `vinai/phobert-base-v2`.
+6. La API devuelve únicamente:
+
+```json
+{
+  "predicted_label": "SUPPORTED" | "REFUTED"
+}
+```
+
+---
+
+## Resultados de Entrenamiento
+
+### PhoBERT-base
+
+Resultado validación:
+
+```text
+Accuracy: 0.6577
+F1-macro: 0.6005
+SUPPORTED f1: 0.6756
+REFUTED f1: 0.3801
+NEI f1: 0.7458
+```
+
+### PhoBERT-base-v2
+
+Mejor resultado validación:
+
+```text
+Best F1-macro: 0.6382
+```
+
+Resultado de una de las últimas épocas:
+
+```text
+Accuracy: 0.6622
+F1-macro: 0.6273
+SUPPORTED f1: 0.6747
+REFUTED f1: 0.4674
+NEI f1: 0.7396
+```
+
+### Decisión final
+
+Se eligió `vinai/phobert-base-v2` como modelo pesado/fallback porque mejoró el F1-macro general y especialmente la clase `REFUTED`, que era la clase más débil.
+
+`mDeBERTa` fue descartado porque durante el fine-tuning presentó inestabilidad numérica recurrente (`Loss: NaN`) y colapso de predicción hacia una sola clase.
 
 ---
 
 ## Archivos del Proyecto
 
-| Archivo | Propósito | Cuándo ejecutar |
-|---------|-----------|-----------------|
-| `train_phobert_evidence.py` | Entrena el modelo ligero con atención por evidencia y loss de certeza | Primero (base del sistema) |
-| `train_mdeberta.py` | Entrena el modelo pesado pre-entrenado en NLI multilingüe | Segundo (fallback del sistema) |
-| `cascade_router.py` | Orquesta la cascada: carga umbrales calibrados, decide ligero vs pesado | En producción (importar como módulo) |
-| `HIGH_CONFIDENCE_*.json` | Datos limpios con consenso de anotadores | Entrenamiento principal |
-| `OG_*.json` | Datos originales con más ruido, incluye clase `NEI` | Complemento opcional |
-| `output_dataset.json` | Metadata de votación y consenso | Auditoría y análisis de errores |
+| Archivo / Carpeta | Propósito |
+|---|---|
+| `app.py` | API FastAPI. Carga modelos y expone `/health` y `/predict`. |
+| `cascade_router.py` | Router de cascada PhoBERT-base → PhoBERT-base-v2. |
+| `train_phobert_evidence.py` | Define la arquitectura `EvidenceAwareFactChecker`, tokenizer e inferencia. |
+| `requirements.txt` | Dependencias Python. No debe incluir `torch` si Docker instala PyTorch CPU por separado. |
+| `dockerfile` | Imagen Docker para la API. |
+| `.dockerignore` | Evita subir datasets, entorno virtual y archivos innecesarios al build. |
+| `phobert_evidence_checkpoints/` | Checkpoint del modelo ligero PhoBERT-base. |
+| `phobert_v2_evidence_checkpoints/` | Checkpoint del modelo pesado PhoBERT-base-v2. |
+
+---
+
+## Estructura Esperada
+
+Antes de ejecutar localmente, dockerizar o subir a Azure, el proyecto debe verse así:
+
+```text
+Fact_Checking_Rocketpowers/
+├── app.py
+├── cascade_router.py
+├── train_phobert_evidence.py
+├── requirements.txt
+├── dockerfile
+├── .dockerignore
+│
+├── phobert_evidence_checkpoints/
+│   ├── best_model.pt
+│   └── router_thresholds.json
+│
+└── phobert_v2_evidence_checkpoints/
+    ├── best_model.pt
+    └── router_thresholds.json
+```
+
+> Importante: los archivos `.pt` no deben extraerse aunque Windows/WinRAR los detecte como comprimidos. PyTorch guarda internamente algunos `.pt` con estructura tipo ZIP, pero el código necesita cargar el archivo completo con `torch.load()`.
 
 ---
 
 ## Requisitos
 
-```bash
-# Core
-pip install torch transformers scikit-learn
+### requirements.txt recomendado
 
-# Opcional: ONNX para inferencia acelerada en GPU
-pip install onnx onnxruntime-gpu
-
-# Opcional: Mixed Precision (AMP) — requiere GPU NVIDIA
-# torch.cuda.amp ya viene incluido en PyTorch ≥1.6
+```txt
+fastapi
+uvicorn[standard]
+transformers
+scikit-learn
+numpy
+pydantic
+sentencepiece
+protobuf
 ```
 
-**Hardware recomendado:**
-- **Entrenamiento ligero**: CPU o GPU con 4GB VRAM (GTX 1050 Ti suficiente)
-- **Entrenamiento pesado**: GPU con 8GB VRAM (RTX 2070 / T4)
-- **Producción**: CPU para ligero + GPU opcional para pesado, o solo CPU con modelo cuantizado
+En Docker, `torch` se instala aparte en versión CPU para evitar instalar librerías CUDA/NVIDIA innecesarias.
 
 ---
 
-## Estructura de Datos
+## Formato de Entrada y Salida
 
-### Formato de entrada (JSON)
+### Entrada esperada
 
 ```json
 {
-  "claim": "Vào chiều ngày 9/9, Tổng Bí thư Tô Lâm đã chủ trì họp triển khai...",
+  "claim": "So với cùng kỳ năm 2024, số vụ tai nạn giao thông tăng.",
   "contexts": [
-    "Tổng Bí thư Tô Lâm nhấn mạnh, ngành giáo dục phải trả lời...",
-    "Ngành giáo dục cần tập trung vào chất lượng đào tạo..."
-  ],
-  "label": "SUPPORTED"
+    "Tình hình tai nạn giao thông giảm cả 3 tiêu chí so với cùng kỳ năm 2024."
+  ]
 }
 ```
 
-| Campo | Tipo | Descripción |
-|-------|------|-------------|
-| `claim` | `str` | Afirmación a verificar (vietnamita) |
-| `contexts` | `list[str]` | Evidencias recuperadas de la web |
-| `label` | `str` | Veredicto: `SUPPORTED` \| `REFUTED` \| `NEI` |
+### Salida obligatoria del torneo
 
-### Familias de datos
+```json
+{
+  "predicted_label": "REFUTED"
+}
+```
 
-| Familia | Archivos | Registros | Uso |
-|---------|----------|-----------|-----|
-| **HIGH_CONFIDENCE** | `train` (3,106), `val` (666), `test` (665) | ~4,437 | **Entrenamiento principal**. Datos con consenso de anotadores. Más limpios, menos ruido. |
-| **OG (Original)** | `train` (5,320), `val` (1,140), `test` (1,140) | ~7,600 | Datos crudos. Incluyen `NEI` y más variabilidad. Útil para robustecer el modelo pesado. |
-| **output_dataset** | `output_dataset.json` | 7,600 | **No para entrenar**. Metadata de votación (`voter_details`, `consensus_score`, `seed_context`). Usar para debug y auditoría. |
+El endpoint nunca debe devolver `NEI`, probabilidades, explicaciones ni campos extra si la plataforma del torneo exige estrictamente el JSON anterior.
 
 ---
 
 ## Entrenamiento
 
-### 5.1 Modelo Ligero (PhoBERT)
-
-**Qué hace:**
-- Usa `vinai/phobert-base` (135M parámetros, vietnamita nativo)
-- Inserta token `<unused0>` antes de cada contexto para delimitar evidencias
-- Aplica `nn.MultiheadAttention` entre los vectores de evidencia extraídos
-- Predice: (1) clase del veredicto, (2) certeza de que NO es `NEI`
-
-**Ejecutar:**
+### Modelo ligero: PhoBERT-base
 
 ```bash
-python train_phobert_evidence.py     --train_json HIGH_CONFIDENCE_train_dataset.json     --val_json HIGH_CONFIDENCE_validation_dataset.json     --batch_size 16     --epochs 7     --freeze_layers 3     --quantize     --output_dir ./phobert_evidence_checkpoints
+python train_phobert_evidence.py \
+  --model_name vinai/phobert-base \
+  --train_json HIGH_CONFIDENCE_train_dataset.json \
+  --val_json HIGH_CONFIDENCE_validation_dataset.json \
+  --batch_size 1 \
+  --epochs 5 \
+  --freeze_layers 3 \
+  --lr 5e-6 \
+  --label_smoothing 0 \
+  --max_grad_norm 0.5 \
+  --output_dir ./phobert_evidence_checkpoints
 ```
 
-**Parámetros clave:**
-
-| Parámetro | Default | Efecto |
-|-----------|---------|--------|
-| `--freeze_layers` | 3 | Congela primeras N capas del encoder. Con 7K datos, evita sobreajuste. |
-| `--label_smoothing` | 0.1 | Suaviza targets. Evita confianza excesiva con pocos ejemplos. |
-| `--lambda_cert` | 0.3 | Peso de la loss auxiliar de certeza. Enseña al modelo a detectar `NEI`. |
-| `--quantize` | — | Guarda versión INT8 para CPU (`best_model_int8.pt`). |
-| `--router_target_f1` | 0.85 | F1 mínimo exigido al calibrar umbrales del router. |
-
-**Salidas generadas:**
-
-```
-phobert_evidence_checkpoints/
-├── best_model.pt              # Checkpoint PyTorch completo
-├── best_model_int8.pt         # Versión cuantizada (si --quantize)
-└── router_thresholds.json     # Umbrales calibrados automáticamente
-```
-
-### 5.2 Modelo Pesado (mDeBERTa-v3)
-
-**Qué hace:**
-- Usa `MoritzLaurer/mDeBERTa-v3-base-mnli-xnli` (278M parámetros)
-- Ya pre-entrenado en NLI (Natural Language Inference) multilingüe, incluye vietnamita
-- Fine-tuning mínimo: reemplaza la cabeza clasificadora (`ignore_mismatched_sizes=True`)
-- Formato de entrada: `claim </s> context1 </s> context2 </s> ...`
-
-**Ejecutar:**
+### Modelo pesado/fallback: PhoBERT-base-v2
 
 ```bash
-python train_mdeberta.py     --train_json HIGH_CONFIDENCE_train_dataset.json     --val_json HIGH_CONFIDENCE_validation_dataset.json     --batch_size 8     --epochs 5     --freeze_layers 6     --export_onnx     --output_dir ./mdeberta_factcheck
+python train_phobert_evidence.py \
+  --model_name vinai/phobert-base-v2 \
+  --train_json HIGH_CONFIDENCE_train_dataset.json \
+  --val_json HIGH_CONFIDENCE_validation_dataset.json \
+  --batch_size 1 \
+  --epochs 5 \
+  --freeze_layers 3 \
+  --lr 5e-6 \
+  --label_smoothing 0 \
+  --max_grad_norm 0.5 \
+  --output_dir ./phobert_v2_evidence_checkpoints
 ```
 
-**Parámetros clave:**
+### Ajustes necesarios en `train_phobert_evidence.py`
 
-| Parámetro | Default | Efecto |
-|-----------|---------|--------|
-| `--freeze_layers` | 6 | Congela embeddings + 6 capas del encoder. Solo entrena la cabeza y capas superiores. |
-| `--export_onnx` | — | Exporta `model.onnx` para inferencia acelerada con ONNX Runtime. |
-| `--amp` | — | Habilita Automatic Mixed Precision (FP16). Ahorra VRAM y acelera en GPU. |
+Para evitar errores CUDA de índices fuera de rango, se usaron dos ajustes importantes:
 
-**Salidas generadas:**
-
+```python
+# Longitud máxima reducida
+max_length: int = 256
 ```
-mdeberta_factcheck/
-├── best_model.pt              # Pesos PyTorch
-├── tokenizer_config.json      # Tokenizer guardado
-├── model.onnx                 # Modelo ONNX (si --export_onnx)
-└── ...
+
+```python
+# Redimensionar embeddings al agregar tokens especiales
+model.encoder.resize_token_embeddings(len(tokenizer.tokenizer))
 ```
 
 ---
 
 ## Inferencia y Cascada
 
-### Uso básico del router
+La cascada funciona así:
+
+```text
+1. PhoBERT-base predice primero.
+2. Si tiene alta confianza, se usa su salida.
+3. Si predice NEI, tiene baja confianza o bajo margen entre SUPPORTED/REFUTED, se consulta PhoBERT-base-v2.
+4. La salida final se fuerza a SUPPORTED o REFUTED.
+```
+
+Criterios típicos de duda:
 
 ```python
-import torch
-from train_phobert_evidence import EvidenceAwareFactChecker, PhoBERTEvidenceTokenizer
-from cascade_router import UncertaintyRouter
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-
-# Dispositivo
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-# --- Cargar ligero ---
-tok_light = PhoBERTEvidenceTokenizer()
-light = EvidenceAwareFactChecker()
-ckpt = torch.load("phobert_evidence_checkpoints/best_model.pt", map_location=device)
-light.load_state_dict(ckpt["model_state_dict"])
-
-# --- Cargar pesado ---
-tok_heavy = AutoTokenizer.from_pretrained("./mdeberta_factcheck")
-heavy = AutoModelForSequenceClassification.from_pretrained(
-    "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli",
-    num_labels=3,
-    ignore_mismatched_sizes=True
+doubt = (
+    pred_id == 2 or          # NEI interno
+    confidence < 0.65 or     # baja confianza
+    margin < 0.15            # SUPPORTED y REFUTED están muy cerca
 )
-heavy.load_state_dict(torch.load("mdeberta_factcheck/best_model.pt", map_location=device))
-
-# --- Crear router ---
-router = UncertaintyRouter(
-    light_model=light,
-    heavy_model=heavy,
-    tokenizer_light=tok_light,
-    tokenizer_heavy=tok_heavy,
-    thresholds_path="phobert_evidence_checkpoints/router_thresholds.json",
-    device=device,
-)
-
-# --- Predecir ---
-result = router.predict(
-    claim="Vào chiều ngày 9/9, Tổng Bí thư Tô Lâm đã chủ trì họp triển khai...",
-    contexts=[
-        "Tổng Bí thư Tô Lâm nhấn mạnh, ngành giáo dục phải trả lời...",
-        "Ngành giáo dục cần tập trung vào chất lượng đào tạo..."
-    ]
-)
-
-print(result)
-```
-
-### Estadísticas del router
-
-```python
-# Ver métricas de routing
-stats = router.get_stats()
-print(stats)
-# {
-#   "light": 145, "heavy": 55, "forced": 12, "total": 200,
-#   "light_rate": 0.725, "heavy_rate": 0.275, "forced_rate": 0.060
-# }
 ```
 
 ---
 
-## Calibración del Router
+## Prueba Local con Uvicorn
 
-El router **no usa umbrales fijos**. Al finalizar el entrenamiento del ligero, se ejecuta `calibrate_router()` que hace grid search sobre el validation set:
+Instalar dependencias:
 
-```python
-# Pseudocódigo de la calibración
-for conf_t in [0.75, 0.80, ..., 0.95]:
-    for ent_t in [0.30, 0.35, ..., 0.55]:
-        for cert_t in [0.55, 0.60, ..., 0.80]:
-            # Aceptar solo si F1-macro ≥ 0.85 en val set
-            # Maximizar cobertura del ligero (tasa de requests que resuelve)
+```powershell
+pip install -r requirements.txt
 ```
 
-Los umbrales óptimos se guardan en `router_thresholds.json`:
+Levantar API:
 
-```json
-{
-  "coverage": 0.72,
-  "conf": 0.85,
-  "entropy": 0.45,
-  "cert": 0.75
-}
+```powershell
+uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
-**Si el archivo no existe**, el router usa valores por defecto y emite un `WARNING`.
+Probar health:
+
+```powershell
+Invoke-RestMethod http://localhost:8000/health
+```
+
+Resultado esperado:
+
+```text
+status router_loaded device
+------ ------------- ------
+ok              True cpu
+```
+
+Probar predict:
+
+```powershell
+$body = @{
+  claim = "So với cùng kỳ năm 2024, số vụ tai nạn giao thông tăng."
+  contexts = @(
+    "Tình hình tai nạn giao thông giảm cả 3 tiêu chí so với cùng kỳ năm 2024."
+  )
+} | ConvertTo-Json -Depth 5 -Compress
+
+$utf8Body = [System.Text.Encoding]::UTF8.GetBytes($body)
+
+Invoke-RestMethod `
+  -Uri "http://localhost:8000/predict" `
+  -Method Post `
+  -ContentType "application/json; charset=utf-8" `
+  -Body $utf8Body
+```
+
+Salida esperada:
+
+```text
+predicted_label
+---------------
+REFUTED
+```
 
 ---
 
-## Monitoreo en Producción
-
-### Alertas configurables
-
-| Situación | Umbral | Acción |
-|-----------|--------|--------|
-| Tasa de `NEI` predichos en validación | `--forced_alert_threshold` (default: 25%) | `WARNING` en logs |
-| Tasa de `was_forced` en producción (ventana deslizante) | `forced_alert_threshold` en router (default: 25%) | `WARNING` en logs |
-
-### Ventana deslizante de drift
-
-El router mantiene una ventana de las últimas 200 solicitudes. Si la tasa de `was_forced` supera el umbral, emite:
-
-```
-WARNING | ALERTA DE DRIFT: tasa de was_forced=32.0% en las últimas 200 solicitudes
-          (umbral=25.0%). Revisar distribución de datos en producción.
-```
-
-Esto detecta:
-- **Data drift**: Los nuevos claims son más difíciles que los de entrenamiento
-- **Model degradation**: El ligero está perdiendo capacidad (posible reentrenamiento necesario)
-
----
-
-## Formato de Salida
-
-### Output obligatorio (tu especificación)
-
-```json
-{
-  "predicted_label": "SUPPORTED",
-  "confidence": 0.9476,
-  "was_forced": false,
-  "tier": "light",
-  "routing_reason": "high_confidence",
-  "certainty_not_nei": 0.8912,
-  "top_evidence_indices": [2, 0, 1],
-  "evidence_attention": [
-    {"evidence_idx": 2, "score": 0.4123},
-    {"evidence_idx": 0, "score": 0.3891},
-    {"evidence_idx": 1, "score": 0.1986}
-  ]
-}
-```
-
-| Campo | Tipo | Descripción |
-|-------|------|-------------|
-| `predicted_label` | `str` | **Siempre** `SUPPORTED` o `REFUTED`. Nunca `NEI` en producción. |
-| `confidence` | `float` | Probabilidad de la clase elegida (0.0–1.0) |
-| `was_forced` | `bool` | `true` si el modelo originalmente predijo `NEI` y se normalizó a binario |
-| `tier` | `str` | `"light"` o `"heavy"` — qué modelo tomó la decisión |
-| `routing_reason` | `str` | Por qué se eligió ese tier (o por qué se escaló) |
-| `certainty_not_nei` | `float` | Confianza interna de que NO es `NEI` (solo en tier ligero) |
-| `top_evidence_indices` | `list[int]` | Índices de los 3 contexts más influyentes |
-| `evidence_attention` | `list[dict]` | Score de atención para **cada** contexto, ordenado descendente |
-
-### Caso: forzado desde `NEI`
-
-```json
-{
-  "predicted_label": "REFUTED",
-  "confidence": 0.6234,
-  "was_forced": true,
-  "tier": "heavy",
-  "routing_reason": "light_uncertain(conf=0.72, ent=0.51, label=NEI)",
-  "light_fallback_label": "NEI"
-}
-```
-
-Cuando `was_forced=true`, el sistema está operando en modo degradado: el modelo no encontró evidencia clara y tuvo que "adivinar" entre las dos opciones permitidas.
-
----
-
-## Docker y Despliegue
+## Docker
 
 ### Dockerfile recomendado
 
@@ -372,119 +374,300 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Instalar dependencias
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# PyTorch CPU >= 2.6, sin CUDA/NVIDIA
+RUN pip install --no-cache-dir torch==2.6.0+cpu \
+    --extra-index-url https://download.pytorch.org/whl/cpu
+
 COPY requirements.txt .
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu     && pip install --no-cache-dir transformers scikit-learn fastapi uvicorn
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copiar modelos entrenados
+COPY app.py .
+COPY cascade_router.py .
+COPY train_phobert_evidence.py .
+
 COPY phobert_evidence_checkpoints/ ./phobert_evidence_checkpoints/
-COPY mdeberta_factcheck/ ./mdeberta_factcheck/
-
-# Copiar código
-COPY train_phobert_evidence.py cascade_router.py main.py ./
+COPY phobert_v2_evidence_checkpoints/ ./phobert_v2_evidence_checkpoints/
 
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
-### requirements.txt
+### .dockerignore recomendado
 
+```dockerignore
+env/
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+.git/
+.gitignore
+
+*.zip
+*.rar
+*.7z
+
+*.ipynb
+*.csv
+*.xlsx
+*.jsonl
+
+OG_train_dataset.json
+OG_validation_dataset.json
+OG_test_dataset.json
+HIGH_CONFIDENCE_train_dataset.json
+HIGH_CONFIDENCE_validation_dataset.json
+HIGH_CONFIDENCE_test_dataset.json
+HIGH_CONFIDENCE_converted_dataset.json
+output_dataset.json
+
+mdeberta_factcheck/
+mdeberta_factcheck_bad_nan/
+mdeberta_factcheck_base/
+mdeberta_factcheck_base_bad_nan/
+
+sample_data/
 ```
-torch>=2.0.0
-transformers>=4.30.0
-scikit-learn>=1.3.0
-fastapi>=0.100.0
-uvicorn>=0.23.0
-numpy>=1.24.0
+
+No ignorar:
+
+```text
+phobert_evidence_checkpoints/
+phobert_v2_evidence_checkpoints/
 ```
 
-### Endpoints FastAPI mínimos
+### Construir imagen
 
-```python
-# main.py (esqueleto)
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import List
+```powershell
+docker build --no-cache -t fact-checking-api -f dockerfile .
+```
 
-app = FastAPI()
+### Ejecutar contenedor
 
-class FactCheckInput(BaseModel):
-    claim: str
-    contexts: List[str]
+```powershell
+docker run -p 8001:8000 fact-checking-api
+```
 
-class FactCheckOutput(BaseModel):
-    predicted_label: str
-    confidence: float
-    was_forced: bool
-    tier: str
+### Probar contenedor
 
-# Cargar router una vez al iniciar (singleton)
-# router = UncertaintyRouter(...)
+```powershell
+Invoke-RestMethod http://localhost:8001/health
+```
 
-@app.post("/predict", response_model=FactCheckOutput)
-async def predict(input_data: FactCheckInput):
-    result = router.predict(input_data.claim, input_data.contexts)
-    return FactCheckOutput(
-        predicted_label=result["predicted_label"],
-        confidence=result["confidence"],
-        was_forced=result["was_forced"],
-        tier=result["tier"]
-    )
+```powershell
+$body = @{
+  claim = "So với cùng kỳ năm 2024, số vụ tai nạn giao thông tăng."
+  contexts = @(
+    "Tình hình tai nạn giao thông giảm cả 3 tiêu chí so với cùng kỳ năm 2024."
+  )
+} | ConvertTo-Json -Depth 5 -Compress
 
-@app.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "light_rate": router.get_stats()["light_rate"],
-        "heavy_rate": router.get_stats()["heavy_rate"],
-    }
+$utf8Body = [System.Text.Encoding]::UTF8.GetBytes($body)
+
+Invoke-RestMethod `
+  -Uri "http://localhost:8001/predict" `
+  -Method Post `
+  -ContentType "application/json; charset=utf-8" `
+  -Body $utf8Body
 ```
 
 ---
 
-## Flujo de Trabajo Recomendado
+## Despliegue en Azure
 
+### Variables
+
+```powershell
+$RESOURCE_GROUP="rg-fact-checking"
+$LOCATION="eastus"
+$ACR_NAME="acrocketpowers01"
+$APP_NAME="fact-checking-api"
+$ENV_NAME="env-fact-checking"
+$IMAGE_NAME="fact-checking-api"
+$TAG="v1"
 ```
-1. Preparar datos
-   └── Asegurar que HIGH_CONFIDENCE_train/val/test.json existen
 
-2. Entrenar ligero
-   └── python train_phobert_evidence.py --quantize
+### Login y providers
 
-3. Verificar router_thresholds.json fue generado
-   └── Si no existe, el router usará defaults (subóptimo)
+```powershell
+az login
+az extension add --name containerapp --upgrade
+az provider register --namespace Microsoft.App
+az provider register --namespace Microsoft.OperationalInsights
+```
 
-4. Entrenar pesado
-   └── python train_mdeberta.py --export_onnx
+### Crear Resource Group
 
-5. Validar cascada offline
-   └── Correr 100 ejemplos de test, verificar light_rate > 60%
+```powershell
+az group create `
+  --name $RESOURCE_GROUP `
+  --location $LOCATION
+```
 
-6. Desplegar
-   └── Docker + FastAPI, monitorear was_forced_rate
+### Crear Azure Container Registry
 
-7. Mantenimiento
-   └── Si forced_rate > 25% durante 1 semana → recolectar datos y reentrenar
+```powershell
+az acr create `
+  --resource-group $RESOURCE_GROUP `
+  --name $ACR_NAME `
+  --sku Basic `
+  --admin-enabled true
+```
+
+### Build y push a ACR
+
+```powershell
+az acr build `
+  --registry $ACR_NAME `
+  --image "$IMAGE_NAME`:$TAG" `
+  -f dockerfile `
+  .
+```
+
+### Verificar imagen
+
+```powershell
+az acr repository list `
+  --name $ACR_NAME `
+  --output table
+```
+
+```powershell
+az acr repository show-tags `
+  --name $ACR_NAME `
+  --repository $IMAGE_NAME `
+  --output table
+```
+
+### Crear entorno de Container Apps
+
+```powershell
+az containerapp env create `
+  --name $ENV_NAME `
+  --resource-group $RESOURCE_GROUP `
+  --location $LOCATION
+```
+
+### Obtener credenciales ACR
+
+```powershell
+$ACR_USERNAME = az acr credential show `
+  --name $ACR_NAME `
+  --query username `
+  -o tsv
+
+$ACR_PASSWORD = az acr credential show `
+  --name $ACR_NAME `
+  --query "passwords[0].value" `
+  -o tsv
+```
+
+### Crear Container App
+
+```powershell
+az containerapp create `
+  --name $APP_NAME `
+  --resource-group $RESOURCE_GROUP `
+  --environment $ENV_NAME `
+  --image "$ACR_NAME.azurecr.io/$IMAGE_NAME`:$TAG" `
+  --target-port 8000 `
+  --ingress external `
+  --cpu 2.0 `
+  --memory 4Gi `
+  --min-replicas 1 `
+  --max-replicas 1 `
+  --registry-server "$ACR_NAME.azurecr.io" `
+  --registry-username $ACR_USERNAME `
+  --registry-password $ACR_PASSWORD
+```
+
+### Obtener URL pública
+
+```powershell
+$APP_URL = az containerapp show `
+  --name $APP_NAME `
+  --resource-group $RESOURCE_GROUP `
+  --query properties.configuration.ingress.fqdn `
+  -o tsv
+
+"https://$APP_URL"
+```
+
+Endpoint final del torneo:
+
+```text
+https://<APP_URL>/predict
+```
+
+### Probar en Azure
+
+```powershell
+Invoke-RestMethod "https://$APP_URL/health"
+```
+
+```powershell
+$body = @{
+  claim = "So với cùng kỳ năm 2024, số vụ tai nạn giao thông tăng."
+  contexts = @(
+    "Tình hình tai nạn giao thông giảm cả 3 tiêu chí so với cùng kỳ năm 2024."
+  )
+} | ConvertTo-Json -Depth 5 -Compress
+
+$utf8Body = [System.Text.Encoding]::UTF8.GetBytes($body)
+
+Invoke-RestMethod `
+  -Uri "https://$APP_URL/predict" `
+  -Method Post `
+  -ContentType "application/json; charset=utf-8" `
+  -Body $utf8Body
 ```
 
 ---
 
-## Preguntas Frecuentes
+## Notas Técnicas
 
-**Q: ¿Por qué dos modelos en lugar de uno solo?**
-A: El ligero (PhoBERT) resuelve ~70% de los casos en 50ms. El pesado (mDeBERTa) solo se activa para los difíciles. Esto reduce costo de computación en ~60% vs usar siempre el pesado, sin sacrificar accuracy en los casos simples.
+### Por qué se descartó mDeBERTa
 
-**Q: ¿Qué pasa si no tengo GPU?**
-A: El ligero cuantizado (INT8) corre cómodamente en CPU moderna. El pesado puede omitirse si la precisión del ligero es suficiente para tu caso de uso, o puedes usar ONNX Runtime para acelerar CPU.
+Se probaron varias configuraciones de mDeBERTa, incluyendo `MoritzLaurer/mDeBERTa-v3-base-mnli-xnli` y `microsoft/mdeberta-v3-base`. En las pruebas completas apareció `Loss: NaN` y el modelo colapsó a una sola clase (`SUPPORTED`). Por estabilidad y desempeño, se descartó para la versión desplegable.
 
-**Q: ¿Por qué `NEI` existe en entrenamiento pero no en salida?**
-A: `NEI` (Not Enough Information) es una clase real en los datos, pero tu especificación de negocio exige que el sistema **siempre** tome posición (`SUPPORTED` o `REFUTED`). El modelo aprende a detectar `NEI` internamente (vía `certainty_head`), pero en producción se fuerza la decisión.
+### Por qué usar PhoBERT/PhoBERT v2
 
-**Q: ¿Cómo interpreto `evidence_attention`?**
-A: Es un ranking de qué `contexts` fueron más determinantes para el veredicto. Un score alto en `evidence_idx: 2` significa que el tercer contexto de la lista fue la evidencia más influyente. Útil para explicar la decisión a usuarios.
+PhoBERT es una familia de modelos especializados en vietnamita. El dataset del proyecto está en vietnamita, por lo que resultó más estable y adecuado usar modelos monolingües vietnamitas en lugar de un modelo multilingüe generalista.
+
+### Sobre `NEI`
+
+`NEI` se usa internamente durante entrenamiento e inferencia para detectar incertidumbre. Sin embargo, la especificación del torneo exige una decisión binaria. Por eso, cuando el modelo predice `NEI`, el sistema selecciona entre `SUPPORTED` y `REFUTED` según la probabilidad mayor.
+
+### Sobre PyTorch CPU en Docker
+
+Para evitar dependencias CUDA/NVIDIA innecesarias, Docker instala PyTorch CPU:
+
+```dockerfile
+RUN pip install --no-cache-dir torch==2.6.0+cpu \
+    --extra-index-url https://download.pytorch.org/whl/cpu
+```
+
+Esto evita errores relacionados con librerías como `libcusparseLt.so.0` y reduce problemas al ejecutar en Azure Container Apps con CPU.
 
 ---
 
-*Sistema desarrollado para fact-checking en idioma vietnamita.*
-*Arquitectura: PhoBERT Evidence-Attention + mDeBERTa-v3 Cascada con Calibración Automática.*
+## Estado Actual
+
+- API local funcionando con Uvicorn.
+- Docker local probado exitosamente.
+- Endpoint `/health` devuelve `router_loaded=True`.
+- Endpoint `/predict` devuelve únicamente `SUPPORTED` o `REFUTED`.
+- Imagen lista para desplegar en Azure Container Apps.
+

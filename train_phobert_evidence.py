@@ -157,7 +157,7 @@ class PhoBERTEvidenceTokenizer:
         if self.evidence_token not in self.tokenizer.get_vocab():
             self.tokenizer.add_tokens([self.evidence_token])
 
-    def encode(self, claim: str, contexts: List[str], max_length: int = 512) -> Dict:
+    def encode(self, claim: str, contexts: List[str], max_length: int = 256) -> Dict:
         claim_tokens = self.tokenizer.encode(claim, add_special_tokens=False)
         all_tokens = [self.tokenizer.cls_token_id] + claim_tokens + [self.tokenizer.sep_token_id]
         spans = []
@@ -384,6 +384,13 @@ def train(args):
         dropout=args.dropout,
         num_labels=3,
     )
+
+    try:
+        model.encoder.resize_token_embeddings(len(tokenizer.tokenizer))
+        logger.info("Resize embeddings aplicado: %d tokens", len(tokenizer.tokenizer))
+    except Exception as e:
+        logger.warning("No se pudo hacer resize_token_embeddings: %s", e)
+
     model.to(device)
 
     if args.freeze_layers > 0:

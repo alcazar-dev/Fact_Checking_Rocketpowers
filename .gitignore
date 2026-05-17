@@ -1,0 +1,85 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+env/
+venv/
+.venv/
+ENV/
+
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Jupyter / notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# Logs
+*.log
+logs/
+
+# Data files / datasets
+*.csv
+*.xlsx
+*.xls
+*.jsonl
+
+HIGH_CONFIDENCE_train_dataset.json
+HIGH_CONFIDENCE_validation_dataset.json
+HIGH_CONFIDENCE_test_dataset.json
+HIGH_CONFIDENCE_converted_dataset.json
+
+OG_train_dataset.json
+OG_validation_dataset.json
+OG_test_dataset.json
+
+output_dataset.json
+
+# Model training outputs / old experiments
+mdeberta_factcheck/
+mdeberta_factcheck_bad_nan/
+mdeberta_factcheck_base/
+mdeberta_factcheck_base_bad_nan/
+
+# Keep final model folders only if you intentionally want to commit them.
+# If GitHub rejects the .pt files because they are too large, uncomment these:
+phobert_evidence_checkpoints/*.pt
+phobert_v2_evidence_checkpoints/*.pt
+phobert_evidence_checkpoints/*.json
+phobert_v2_evidence_checkpoints/*.json
+
+# Compressed files
+*.zip
+*.rar
+*.7z
+*.tar
+*.tar.gz
+
+# Docker / build cache
+.docker/
+docker-compose.override.yml
+
+# Azure / local deployment artifacts
+.azure/
+*.pem
+*.key
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Misc
+sample_data/
