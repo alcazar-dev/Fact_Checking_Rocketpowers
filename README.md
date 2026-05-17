@@ -1,9 +1,3 @@
-hola
-
-voy a entrenarlo en colab
-
-https://drive.google.com/drive/folders/1GMTKQ0O5SXmRnh--9mFzw9uoWuXcvFub?usp=sharing
-
 # Fact-Check Vietnamita - Sistema de Verificación de Afirmaciones
 
 Sistema de fact-checking para idioma vietnamita con arquitectura en cascada:
