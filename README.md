@@ -435,48 +435,6 @@ async def health():
     }
 ```
 
----
-
-## Flujo de Trabajo Recomendado
-
-```
-1. Preparar datos
-   └── Asegurar que HIGH_CONFIDENCE_train/val/test.json existen
-
-2. Entrenar ligero
-   └── python train_phobert_evidence.py --quantize
-
-3. Verificar router_thresholds.json fue generado
-   └── Si no existe, el router usará defaults (subóptimo)
-
-4. Entrenar pesado
-   └── python train_mdeberta.py --export_onnx
-
-5. Validar cascada offline
-   └── Correr 100 ejemplos de test, verificar light_rate > 60%
-
-6. Desplegar
-   └── Docker + FastAPI, monitorear was_forced_rate
-
-7. Mantenimiento
-   └── Si forced_rate > 25% durante 1 semana → recolectar datos y reentrenar
-```
-
----
-
-## Preguntas Frecuentes
-
-**Q: ¿Por qué dos modelos en lugar de uno solo?**
-A: El ligero (PhoBERT) resuelve ~70% de los casos en 50ms. El pesado (mDeBERTa) solo se activa para los difíciles. Esto reduce costo de computación en ~60% vs usar siempre el pesado, sin sacrificar accuracy en los casos simples.
-
-**Q: ¿Qué pasa si no tengo GPU?**
-A: El ligero cuantizado (INT8) corre cómodamente en CPU moderna. El pesado puede omitirse si la precisión del ligero es suficiente para tu caso de uso, o puedes usar ONNX Runtime para acelerar CPU.
-
-**Q: ¿Por qué `NEI` existe en entrenamiento pero no en salida?**
-A: `NEI` (Not Enough Information) es una clase real en los datos, pero tu especificación de negocio exige que el sistema **siempre** tome posición (`SUPPORTED` o `REFUTED`). El modelo aprende a detectar `NEI` internamente (vía `certainty_head`), pero en producción se fuerza la decisión.
-
-**Q: ¿Cómo interpreto `evidence_attention`?**
-A: Es un ranking de qué `contexts` fueron más determinantes para el veredicto. Un score alto en `evidence_idx: 2` significa que el tercer contexto de la lista fue la evidencia más influyente. Útil para explicar la decisión a usuarios.
 
 ---
 
