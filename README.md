@@ -3,6 +3,7 @@
 Proyecto desarrollado para el módulo de Cloud Computing.
 
 **Equipo 1:**
+
 Erick Isaac Lascano Otañez - A00836571
 
 Pedro Soto Juárez - A00837560
